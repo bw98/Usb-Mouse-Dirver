@@ -36,6 +36,10 @@ static struct usb_device_id usb_mouse_id_table[] = {
         { } /* Terminating entry */
 };
 
+//这个宏用来让运行在用户空间的程序知道这个驱动程序能够支持的设备，
+//对于 USB 驱动程序来说，第一个参数必须是 usb
+MODULE_DEVICE_TABLE (usb, usb_mouse_id_table);
+
 //urb结束处理回调函数
 //当这个函数被调用时, USB core 就完成了这个urb, 并将它的控制权返回给设备驱动
 static void completion (struct urb* urb) {
