@@ -1,7 +1,7 @@
-# Linux Kernel 2.6.0 ：实现一个鼠标驱动
+# Linux Kernel 3.10.1 ：实现一个鼠标驱动
 ### Q：如何使用该驱动?
- #### 1. 安装去掉自带HID USB驱动程序的 linux-2.6.0 内核
-######      具体操作 (位于 linux-2.6.0 内核目录)：
+ #### 1. 安装去掉自带HID USB驱动程序的 linux-3.10.1 内核，否则会导致冲突
+######      具体操作 (位于 linux-3.10.1 内核源码目录)：
                make clean
                make menuconfig
               -> Device Drivers
