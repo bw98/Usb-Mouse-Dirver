@@ -1,10 +1,14 @@
 #include<linux/kernel.h>
 #include<linux/slab.h>
-#include<linux/input.h>
+#include<linux/usb/input.h>
 #include<linux/module.h>
 #include<linux/init.h>
-#include<include/linux/usb.h>
-#include<linux/types.h>
+#include<linux/hid.h>
+
+/* for apple IDs */
+#ifdef CONFIG_USB_HID_MODULE
+#include <../drivers/hid/hid-ids.h>
+#endif
 
 //模块声明与描述
 #define DRIVER_VERSION "did by bw98 on kernel v2.6.0"
@@ -12,7 +16,7 @@
 #define DRIVER_DESC "usb mouse driver"
 #define DRIVER_LICENSE "GPL"
 
-MODULE_DESCRIPTION(DRIVER_DEC);
+MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_AUTHOR(DRIVER_AUTHOR);
 //许可权限申明
 MODULE_LICENSE(DRIVER_LICENSE);
@@ -42,7 +46,7 @@ MODULE_DEVICE_TABLE (usb, usb_mouse_id_table);
 
 //urb结束处理回调函数
 //当这个函数被调用时, USB core 就完成了这个urb, 并将它的控制权返回给设备驱动
-static void completion (struct urb* urb) {
+static void usb_mouse_irq (struct urb* urb) {
     struct usb_mouse *mouse = urb->context;
     signed char *buf = mouse->data;
     struct input_dev *dev = mouse->dev;
@@ -60,9 +64,9 @@ static void completion (struct urb* urb) {
     switch(urb->status) {
         case 0 :
             break;
-        case ECONNRESET :
-        case ENOENT :
-        case ESHUTDOWN :
+        case -ECONNRESET :
+        case -ENOENT :
+        case -ESHUTDOWN :
             return;
         default :
             goto resubmit;
@@ -90,12 +94,29 @@ static void completion (struct urb* urb) {
 resubmit:
     status = usb_submit_urb (urb, GFP_ATOMIC);
         if (status)
-            err ("can't resubmit intr, %s-%s/input0, status %d",
+            dev_err(&mouse->usbdev->dev, 
+		    "can't resubmit intr, %s-%s/input0, status %d\n",
                     mouse->usbdev->bus->bus_name,
-                    mouse->usbdev->devpath, status
-                );
+                    mouse->usbdev->devpath, status);
 }
 
+//当应用层打开鼠标设备时，调用 usb_mouse_open 方法
+//向USB core 递交 probe中构建的 urb
+static int usb_mouse_open (struct input_dev *dev) {
+    struct usb_mouse *mouse = input_get_drvdata(dev);
+    mouse->irq->dev = mouse->usbdev;
+    if (usb_submit_urb(mouse->irq, GFP_KERNEL))
+        return -EIO;
+
+    return 0;
+}
+
+//当应用层关闭鼠标设备时，调用 usb_mouse_close 方法
+//调用 usb_kill_urb 函数,终止 urb 的生命周期
+static void usb_mouse_close (struct input_dev *dev) {
+    struct usb_mouse *mouse = input_get_drvdata(dev);
+    usb_kill_urb(mouse->irq);
+}
 
 //当有一个接口可以由 usb_mouse_driver 处理时，调用 probe 方法
 //将设备信息保存到接口，并向 USB core 注册设备，构建urb
@@ -114,6 +135,7 @@ static int usb_mouse_probe (struct usb_interface *intf, const struct usb_device_
     struct usb_mouse *mouse;
     struct input_dev *input_dev;
     int pipe, maxp;
+    int error = -ENOMEM;
 
     /*********第二阶段:利用遍历各端点以及接口所在设备的信息,初始化 mouse,input_dev 中的字段*********/
 
@@ -170,26 +192,28 @@ static int usb_mouse_probe (struct usb_interface *intf, const struct usb_device_
     if (!strlen(mouse->name)) {
         snprintf(mouse->name, sizeof(mouse->name),
                     "USB HID BP Mouse %04x:%04x",
-                    le16_to_cpu(dev->descriptor.ID_VENDOR)
-                    le16_to_cpu(dev->descriptor.ID_PRODUCT));
+                    le16_to_cpu(dev->descriptor.idVendor),
+                    le16_to_cpu(dev->descriptor.idProduct));
     }
 
     //设置鼠标设备路径
-    char path[64];
-    usb_make_path (dev, path, sizeof(path));
-    sprintf(mouse->phys, "%s/input0", path);
+    usb_make_path (dev, mouse->phys, sizeof(mouse->phys));
+    strlcat(mouse->phys, "/input0", sizeof(mouse->phys));
 
     //初始化输入设备
     input_dev->name = mouse->name;
     input_dev->phys = mouse->phys;
     usb_to_input_id(dev, &input_dev->id);
-    input_dev->cdev.dev = &intf->dev;
+    input_dev->dev.parent = &intf->dev;
+
     input_dev->evbit[0] = BIT(EV_KEY) | BIT(EV_REL);
-    input_dev->keybit[LONG(BTN_MOUSE)] = BIT(BTN_LEFT) | BIT(BTN_RIGHT) | BIT(BTN_MIDDLE);
+    input_dev->keybit[BIT_WORD(BTN_MOUSE)] = BIT(BTN_LEFT) | BIT(BTN_RIGHT) | BIT(BTN_MIDDLE);
     input_dev->relbit[0] = BIT(REL_X) | BIT(REL_Y);
-    input_dev->keybit[LONG(BTN_MOUSE)] |= BIT(BTN_SIDE) | BIT(BTN_EXTRA);
+    input_dev->keybit[BIT_WORD(BTN_MOUSE)] |= BIT(BTN_SIDE) | BIT(BTN_EXTRA);
     input_dev->relbit[0] |= BIT(REL_WHEEL);
-    input_dev->private = mouse;   //input_dev的 private 成员相当于是设备类型，这里指 mouse
+
+    input_set_drvdata(input_dev, mouse);
+
     input_dev->open = usb_mouse_open;   //填充输入设备的 open 函数指针
     input_dev->close = usb_mouse_close;   //填充输入设备的 close 函数指针
 
@@ -203,13 +227,13 @@ static int usb_mouse_probe (struct usb_interface *intf, const struct usb_device_
      */
     usb_fill_int_urb (mouse->irq, dev, pipe, mouse->data,
                         (maxp > 8 ? 8 : maxp),
-                        completion, mouse, endpoint->bInterval );
+                        usb_mouse_irq, mouse, endpoint->bInterval );
     mouse->irq->transfer_dma = mouse->data_dma;
     mouse->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-    input_register_device(mouse->dev); //向内核注册输入设备
-    printk(KERN_INFO "input: %s on %s/n", mouse->name, path);
-
+    error = input_register_device(mouse->dev); //向内核注册输入设备
+    if(error)
+        goto fail3;
     /* 一般在 probe 函数中，都需要将设备相关信息保存在一个 usb_interface 结构体中，以便
      * 以后通过 usb_get_intfdata 获取使用 (实现多态，通过接口获取设备)
      */
@@ -220,10 +244,13 @@ static int usb_mouse_probe (struct usb_interface *intf, const struct usb_device_
 fail1:
     input_free_device(input_dev);
     kfree(mouse);
-    return -ENOMEM;
+    return error;
 
 fail2:
-    usb_buffer_free(dev, 8, mouse->data, mouse->data_dma);
+    usb_free_coherent(dev, 8, mouse->data, mouse->data_dma);
+
+fail3:
+    usb_free_urb(mouse->irq);
 }
 
 //当一个USB接口从系统移除时，调用 disconnect 方法
@@ -239,55 +266,36 @@ static void usb_mouse_disconnect (struct usb_interface *intf) {
         //从输入子系统中注销设备
         input_unregister_device(mouse->dev);
         // 释放存放鼠标设备 data 存储空间
-        usb_buffer_free(interface_to_usbdev(intf), 8, mouse->data, mouse->data_dma);
+        usb_free_coherent(interface_to_usbdev(intf), 8, mouse->data, mouse->data_dma);
         //释放 usb_mouse 对象
         kfree(mouse);
     }
 }
 
-//当应用层打开鼠标设备时，调用 usb_mouse_open 方法
-//向USB core 递交 probe中构建的 urb
-static int usb_mouse_open (struct intput_dev *dev) {
-    struct usb_mouse *mouse = dev->private;
-    mouse->irq->dev = mouse->usbdev;
-    if (usb_submit_urb(mouse->irq, GFP_KERNEL))
-        return -EIO;
-
-    return 0;
-}
-
-//当应用层关闭鼠标设备时，调用 usb_mouse_close 方法
-//调用 usb_kill_urb 函数,终止 urb 的生命周期
-static void usb_mouse_close (struct input_dev *dev) {
-    struct usb_mouse *mouse = dev->private;
-    usb_kill_urb(mouse->irq);
-}
-
 //构造usb鼠标驱动并注册到内核
-struct usb_driver usb_mouse_driver = {
+static struct usb_driver usb_mouse_driver = {
     //驱动名字
-    .name = "my_usb_mouse";
+    .name = "my_usbmouse",
     //探测方法
-    .probe = usb_mouse_probe;
+    .probe = usb_mouse_probe,
     //断开方法
-    .disconnect = usb_mouse_disconnect;
+    .disconnect = usb_mouse_disconnect,
     //描述该USB驱动所支持设备的id列表
-    .id_table = use_mouse_id_table;
+    .id_table = usb_mouse_id_table,
 };
 
 //加载驱动, 向 USB core 注册该驱动
-static int __init usb_mouse_init(void) {
-    int ret = usb_register(&usb_mouse_driver); //注册鼠标驱动
-    if (ret == 0)
-         info(DRIVER_VERSION ":" DRIVER_DESC);
-    return ret;
-}
+//static int __init usb_mouse_init(void) {
+//    int ret = usb_register(&usb_mouse_driver); //注册鼠标驱动
+//    if (ret == 0)
+//         info(DRIVER_VERSION ":" DRIVER_DESC);
+//    return ret;
+//}
 
 //向 USB core 删除该驱动
-static void __exit usb_mouse_exit(void) {
-    usb_deregister(&usb_mouse_driver);
-}
+//static void __exit usb_mouse_exit(void) {
+//    usb_deregister(&usb_mouse_driver);
+//}
 
-module_init(usb_mouse_init);
-module_exit(usb_mouse_exit);
-
+//内核版本高于3.x时使用module_usb_driver向USB core 注册和删除驱动
+module_usb_driver(usb_mouse_driver); 
