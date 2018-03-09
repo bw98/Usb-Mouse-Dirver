@@ -23,3 +23,5 @@
                rmmod usbmouse.ko
               dmesg -c     # 查看输出
     
+### Q：设计的逻辑流程图是怎样的？
+####   A：我放在了我的博客里：http://www.cnblogs.com/Bw98blogs/p/8536942.html
